@@ -1,0 +1,272 @@
+#!/bin/zsh
+
+set -e
+
+API_TOKEN="${SHORTCUT_API_TOKEN}"
+
+if [[ -z "$API_TOKEN" ]]; then
+  echo "Error: SHORTCUT_API_TOKEN environment variable is not set" >&2
+  exit 1
+fi
+
+API_BASE="https://api.app.shortcut.com/api/v3"
+
+fetch_current_user() {
+  curl -s -X GET \
+    -H "Content-Type: application/json" \
+    -H "Shortcut-Token: $API_TOKEN" \
+    "$API_BASE/member"
+}
+
+search_stories() {
+  local query="$1"
+  curl -s -X GET \
+    -H "Content-Type: application/json" \
+    -H "Shortcut-Token: $API_TOKEN" \
+    "$API_BASE/search/stories?query=$(printf '%s' "$query" | jq -sRr @uri)"
+}
+
+slugify() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//' | cut -c1-50
+}
+
+fetch_stories() {
+  local show_message="${1:-true}"
+  
+  [[ "$show_message" == "true" ]] && echo "Fetching your stories from Shortcut..."
+
+  local tmp_unstarted=$(mktemp)
+  local tmp_started=$(mktemp)
+  local tmp_stories=$(mktemp)
+
+  search_stories "owner:$mention_name is:unstarted" > "$tmp_unstarted"
+  search_stories "owner:$mention_name is:started !is:done" > "$tmp_started"
+
+  jq -s '
+    [.[0].data // [], .[1].data // []] | add | unique_by(.id) | sort_by(.id) | reverse
+  ' "$tmp_unstarted" "$tmp_started" > "$tmp_stories"
+
+  rm -f "$tmp_unstarted" "$tmp_started"
+
+  local story_count=$(jq 'length' "$tmp_stories")
+
+  branch_names=()
+  story_names=()
+
+  if [[ "$story_count" -eq 0 ]]; then
+    rm -f "$tmp_stories"
+    return 0
+  fi
+
+  for ((i = 0; i < story_count; i++)); do
+    local story_id=$(jq -r ".[$i].id" "$tmp_stories")
+    local story_name=$(jq -r ".[$i].name" "$tmp_stories" | tr -d '\000-\037')
+    local formatted_branch=$(jq -r ".[$i].formatted_vcs_branch_name // empty" "$tmp_stories")
+    
+    if [[ -n "$formatted_branch" ]]; then
+      branch_name="$formatted_branch"
+    else
+      local slug=$(slugify "$story_name")
+      branch_name="${mention_name}/sc-${story_id}/${slug}"
+    fi
+    
+    branch_names+=("$branch_name")
+    story_names+=("$story_name")
+  done
+
+  rm -f "$tmp_stories"
+  return 0
+}
+
+user_data=$(fetch_current_user)
+mention_name=$(echo "$user_data" | jq -r '.mention_name')
+
+if [[ -z "$mention_name" || "$mention_name" == "null" ]]; then
+  echo "Error: Could not fetch current user" >&2
+  exit 1
+fi
+
+fetch_stories
+
+if [[ ${#branch_names[@]} -eq 0 ]]; then
+  echo "No unstarted or in-progress stories found."
+  exit 0
+fi
+
+tput_hide_cursor=$(tput civis)
+tput_show_cursor=$(tput cnorm)
+
+last_lines_drawn=0
+
+cleanup() {
+  printf "%s" "$tput_show_cursor"
+  if ((last_lines_drawn > 0)); then
+    printf "\033[%dA" "$last_lines_drawn"
+    printf "\033[J"
+  fi
+}
+trap cleanup EXIT
+
+selected=0
+search=""
+max_display=10
+scroll_offset=0
+
+display_indices=()
+for i in {1..${#branch_names[@]}}; do
+  display_indices+=($i)
+done
+
+filter_branches() {
+  display_indices=()
+  local pattern="*${search}*"
+  for i in {1..${#branch_names[@]}}; do
+    local branch="${branch_names[$i]}"
+    local story="${story_names[$i]}"
+    if [[ -z "$search" || "${branch:l}" == ${~pattern:l} || "${story:l}" == ${~pattern:l} ]]; then
+      display_indices+=($i)
+    fi
+  done
+}
+
+render() {
+  if ((last_lines_drawn > 0)); then
+    printf "\033[%dA" "$last_lines_drawn"
+    printf "\033[J"
+  fi
+  
+  local lines=0
+  local total=${#display_indices[@]}
+  local visible_count=$((total < max_display ? total : max_display))
+  
+  if ((selected < scroll_offset)); then
+    scroll_offset=$selected
+  elif ((selected >= scroll_offset + max_display)); then
+    scroll_offset=$((selected - max_display + 1))
+  fi
+  
+  if [[ -n "$search" ]]; then
+    printf "\033[90mSearch: \033[0m%s\n" "$search"
+  else
+    printf "\033[90mType to search, ↑/↓ to navigate, Enter to select, r to refresh, Esc to cancel\033[0m\n"
+  fi
+  ((lines++)) || true
+  
+  if [[ $total -eq 0 ]]; then
+    printf "\033[33mNo matching branches\033[0m\n"
+    ((lines++)) || true
+    last_lines_drawn=$lines
+    return
+  fi
+  
+  for ((i = scroll_offset; i < scroll_offset + visible_count && i < total; i++)); do
+    local idx="${display_indices[$((i + 1))]}"
+    local branch="${branch_names[$idx]}"
+    local story="${story_names[$idx]}"
+    if ((i == selected)); then
+      printf "\033[36m❯ %s\033[0m\n" "$branch"
+      printf "\033[2m  %s\033[0m\n" "$story"
+    else
+      printf "  %s\n" "$branch"
+      printf "\033[2m  %s\033[0m\n" "$story"
+    fi
+    ((lines += 2)) || true
+  done
+  
+  if ((total > max_display)); then
+    printf "\033[90m(%d-%d of %d)\033[0m\n" "$((scroll_offset + 1))" "$((scroll_offset + visible_count))" "$total"
+    ((lines++)) || true
+  fi
+  
+  last_lines_drawn=$lines
+}
+
+printf "%s" "$tput_hide_cursor"
+render
+
+while true; do
+  key=""
+  read -rsk1 key
+  
+  if [[ "$key" == $'\e' ]]; then
+    read -rsk1 -t 0.2 key2 2>/dev/null || key2=""
+    if [[ -n "$key2" ]]; then
+      key+="$key2"
+      read -rsk1 -t 0.2 key3 2>/dev/null || key3=""
+      [[ -n "$key3" ]] && key+="$key3"
+    fi
+  fi
+  
+  case "$key" in
+    $'\e[A'|$'\eOA') # Up arrow
+      ((selected > 0)) && ((selected--)) || true
+      ;;
+    $'\e[B'|$'\eOB') # Down arrow
+      ((selected < ${#display_indices[@]} - 1)) && ((selected++)) || true
+      ;;
+    $'\e'|$'\e[') # Standalone Escape or incomplete sequence
+      echo "Cancelled" >&2
+      exit 1
+      ;;
+    $'\n'|$'\r') # Enter
+      if [[ ${#display_indices[@]} -gt 0 ]]; then
+        local idx="${display_indices[$((selected + 1))]}"
+        chosen="${branch_names[$idx]}"
+        cleanup
+        trap - EXIT
+        
+        if git rev-parse --verify "$chosen" >/dev/null 2>&1; then
+          echo "Branch exists locally, switching to it..."
+          git checkout "$chosen"
+        elif git ls-remote --heads origin "$chosen" 2>/dev/null | grep -q "$chosen"; then
+          echo "Branch exists on remote, fetching and checking out..."
+          git fetch origin "$chosen"
+          git checkout "$chosen"
+        else
+          echo "Creating new branch from current HEAD..."
+          git checkout -b "$chosen"
+        fi
+        exit 0
+      fi
+      ;;
+    $'\x7f'|$'\b') # Backspace
+      if [[ -n "$search" ]]; then
+        search="${search%?}"
+        selected=0
+        scroll_offset=0
+        filter_branches
+      fi
+      ;;
+    r|R) # Refresh stories
+      if [[ -z "$search" ]]; then
+        if ((last_lines_drawn > 0)); then
+          printf "\033[%dA" "$last_lines_drawn"
+          printf "\033[J"
+        fi
+        last_lines_drawn=0
+        printf "\033[90mRefreshing stories...\033[0m\n"
+        fetch_stories "false"
+        selected=0
+        scroll_offset=0
+        display_indices=()
+        for i in {1..${#branch_names[@]}}; do
+          display_indices+=($i)
+        done
+        printf "\033[1A\033[J"
+      else
+        search+="$key"
+        selected=0
+        scroll_offset=0
+        filter_branches
+      fi
+      ;;
+    [[:print:]]) # Printable characters
+      search+="$key"
+      selected=0
+      scroll_offset=0
+      filter_branches
+      ;;
+  esac
+  
+  render
+done

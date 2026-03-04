@@ -1,0 +1,187 @@
+#!/bin/zsh
+
+# git-switch-interactive - Interactive git branch switcher with fuzzy search
+# Sorts branches by most recently checked out
+
+set -e
+
+ACTION="copy"
+while getopts "ds" opt; do
+    case $opt in
+        d) ACTION="delete" ;;
+        s) ACTION="switch" ;;
+        *) echo "Usage: $0 [-d | -s]" >&2; exit 1 ;;
+    esac
+done
+
+if ! git rev-parse --git-dir &>/dev/null; then
+    echo "Error: Not a git repository" >&2
+    exit 1
+fi
+
+get_branches_by_recency() {
+    git for-each-ref --sort=-committerdate refs/heads/ --format='%(refname:short)' 2>/dev/null
+}
+
+current_branch=$(git branch --show-current 2>/dev/null || echo "")
+
+branches=("${(@f)$(get_branches_by_recency)}")
+
+if [[ ${#branches[@]} -eq 0 ]]; then
+    echo "No branches found" >&2
+    exit 1
+fi
+
+filtered_branches=()
+for branch in "${branches[@]}"; do
+    [[ -n "$branch" && "$branch" != "$current_branch" ]] && filtered_branches+=("$branch")
+done
+
+if [[ ${#filtered_branches[@]} -eq 0 ]]; then
+    echo "No other branches to switch to" >&2
+    exit 1
+fi
+
+tput_hide_cursor=$(tput civis)
+tput_show_cursor=$(tput cnorm)
+
+last_lines_drawn=0
+
+cleanup() {
+    printf "%s" "$tput_show_cursor"
+    if ((last_lines_drawn > 0)); then
+        printf "\033[%dA" "$last_lines_drawn"
+        printf "\033[J"
+    fi
+}
+trap cleanup EXIT
+
+selected=0
+search=""
+display_branches=("${filtered_branches[@]}")
+max_display=10
+scroll_offset=0
+
+filter_branches() {
+    display_branches=()
+    local pattern="*${search}*"
+    for branch in "${filtered_branches[@]}"; do
+        if [[ -z "$search" || "${branch:l}" == ${~pattern:l} ]]; then
+            display_branches+=("$branch")
+        fi
+    done
+}
+
+render() {
+    if ((last_lines_drawn > 0)); then
+        printf "\033[%dA" "$last_lines_drawn"
+        printf "\033[J"
+    fi
+    
+    local lines=0
+    local total=${#display_branches[@]}
+    local visible_count=$((total < max_display ? total : max_display))
+    
+    if ((selected < scroll_offset)); then
+        scroll_offset=$selected
+    elif ((selected >= scroll_offset + max_display)); then
+        scroll_offset=$((selected - max_display + 1))
+    fi
+    
+    if [[ -n "$search" ]]; then
+        printf "\033[90mSearch: \033[0m%s\n" "$search"
+    else
+        printf "\033[90mType to search, ↑/↓ to navigate, Enter to select, Esc to cancel\033[0m\n"
+    fi
+    ((lines++)) || true
+    
+    if [[ $total -eq 0 ]]; then
+        printf "\033[33mNo matching branches\033[0m\n"
+        ((lines++)) || true
+        last_lines_drawn=$lines
+        return
+    fi
+    
+    for ((i = scroll_offset; i < scroll_offset + visible_count && i < total; i++)); do
+        local branch="${display_branches[$((i + 1))]}"
+        if ((i == selected)); then
+            printf "\033[36m❯ %s\033[0m\n" "$branch"
+        else
+            printf "  %s\n" "$branch"
+        fi
+        ((lines++)) || true
+    done
+    
+    if ((total > max_display)); then
+        printf "\033[90m(%d-%d of %d)\033[0m\n" "$((scroll_offset + 1))" "$((scroll_offset + visible_count))" "$total"
+        ((lines++)) || true
+    fi
+    
+    last_lines_drawn=$lines
+}
+
+printf "%s" "$tput_hide_cursor"
+render
+
+while true; do
+    key=""
+    read -rsk1 key
+    
+    if [[ "$key" == $'\e' ]]; then
+        read -rsk1 -t 0.2 key2 2>/dev/null || key2=""
+        if [[ -n "$key2" ]]; then
+            key+="$key2"
+            read -rsk1 -t 0.2 key3 2>/dev/null || key3=""
+            [[ -n "$key3" ]] && key+="$key3"
+        fi
+    fi
+    
+    case "$key" in
+        $'\e[A'|$'\eOA') # Up arrow
+            ((selected > 0)) && ((selected--)) || true
+            ;;
+        $'\e[B'|$'\eOB') # Down arrow
+            ((selected < ${#display_branches[@]} - 1)) && ((selected++)) || true
+            ;;
+        $'\e'|$'\e[') # Standalone Escape or incomplete sequence
+            echo "Cancelled" >&2
+            exit 1
+            ;;
+        $'\n'|$'\r') # Enter
+            if [[ ${#display_branches[@]} -gt 0 ]]; then
+                chosen="${display_branches[$((selected + 1))]}"
+                cleanup
+                trap - EXIT
+                case "$ACTION" in
+                    delete)
+                        git branch -d "$chosen" 2>&1 || git branch -D "$chosen"
+                        ;;
+                    switch)
+                        git switch "$chosen"
+                        ;;
+                    *)
+                        printf "%s" "$chosen" | pbcopy
+                        printf "Copied to clipboard: \033[36m%s\033[0m\n" "$chosen"
+                        ;;
+                esac
+                exit 0
+            fi
+            ;;
+        $'\x7f'|$'\b') # Backspace
+            if [[ -n "$search" ]]; then
+                search="${search%?}"
+                selected=0
+                scroll_offset=0
+                filter_branches
+            fi
+            ;;
+        [[:print:]]) # Printable characters
+            search+="$key"
+            selected=0
+            scroll_offset=0
+            filter_branches
+            ;;
+    esac
+    
+    render
+done
