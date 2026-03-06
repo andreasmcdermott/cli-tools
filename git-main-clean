@@ -1,0 +1,44 @@
+#!/bin/zsh
+
+set -e
+
+force_delete="false"
+while getopts "f" opt; do
+  case "$opt" in
+    f) force_delete="true" ;;
+    *) echo "Usage: $0 [-f]" >&2; exit 1 ;;
+  esac
+done
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "Error: Not a git repository" >&2
+  exit 1
+fi
+
+main_branch="main"
+current_branch=$(git branch --show-current 2>/dev/null || echo "")
+
+if [[ -z "$current_branch" ]]; then
+  echo "Error: Detached HEAD; nothing to delete" >&2
+  exit 1
+fi
+
+if [[ "$current_branch" == "$main_branch" ]]; then
+  echo "Refusing to delete $main_branch" >&2
+  exit 1
+fi
+
+if ! git switch "$main_branch"; then
+  echo "Error: Unable to switch to $main_branch" >&2
+  exit 1
+fi
+
+delete_flag="-d"
+[[ "$force_delete" == "true" ]] && delete_flag="-D"
+
+if ! git branch "$delete_flag" "$current_branch"; then
+  if [[ "$delete_flag" == "-d" ]]; then
+    echo "Failed to delete $current_branch; rerun with -f to force" >&2
+  fi
+  exit 1
+fi
