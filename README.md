@@ -21,3 +21,14 @@ Lets me pick a branch from my stories in Shortcut. Requires `SHORTCUT_API_TOKEN`
 I have it aliased as `shb`.
 
 - `shb`: Creates the branch if it doesn't exist, or switches to it if it does.
+
+## git-main-clean
+
+Delete the current (unless `main`) branch and move me to `main`.
+
+### Usage
+
+I have it aliased as `gbdd`.
+
+- `gbdd`: Switch to `main` and delete whatever branch I was on.
+
